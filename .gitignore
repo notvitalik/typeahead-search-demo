@@ -452,3 +452,16 @@ $RECYCLE.BIN/
 !.vscode/tasks.json
 !.vscode/launch.json
 !.vscode/extensions.json
+# Backup files
+*.bkp
+*bkp*
+
+# Aider - AI coding assistant files
+.aider*
+aider/
+*aider*
+
+# Local settings with secrets
+appsettings.Development.json
+appsettings.Local.json
+*.local.json
