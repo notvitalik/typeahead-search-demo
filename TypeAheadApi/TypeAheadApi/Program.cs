@@ -1,10 +1,7 @@
-using System;
-using System.Data;
-using System.IO;
-using Microsoft.Extensions.Logging;
-using Microsoft.Data.SqlClient;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Data.SqlClient;
+using TypeAheadApi.Models;
+using TypeAheadApi.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -18,6 +15,7 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 builder.Services.AddMemoryCache();
 builder.Services.AddHealthChecks();
+builder.Services.AddScoped<ICustomerTypeaheadService, CustomerTypeaheadService>();
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowAll", p => p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader());
@@ -106,66 +104,25 @@ if (app.Environment.IsDevelopment())
 app.MapGet("/api/customers/typeahead", async (
     [FromQuery] string q,
     [FromQuery] int? limit,
-    [FromServices] IConfiguration config,
-    [FromServices] IMemoryCache cache,
+    [FromServices] ICustomerTypeaheadService service,
     CancellationToken ct) =>
 {
-    q = (q ?? string.Empty).Trim();
-    var lim = Math.Clamp(limit ?? 10, 1, 50);
-
-    if (IsTooShort(q))
-        return Results.Ok(Array.Empty<TypeaheadItem>());
-
-    var cs = config.GetConnectionString("Sql");
-    if (string.IsNullOrWhiteSpace(cs))
-        return Results.Problem("Missing ConnectionStrings:Sql in appsettings.json");
-
-    // Cache key for hot queries
-    var cacheKey = $"cust:ta:{q.ToUpperInvariant()}:{lim}";
-    if (cache.TryGetValue(cacheKey, out TypeaheadItem[] cached))
-        return Results.Ok(cached);
-
-    var results = new List<TypeaheadItem>(lim);
-
-    await using var conn = new SqlConnection(cs);
-
-    await conn.OpenAsync(ct);
-
-    await using var cmd = new SqlCommand("dbo.usp_CustomerTypeahead", conn)
+    try
     {
-        CommandType = CommandType.StoredProcedure,
-        CommandTimeout = 5
-    };
-
-    cmd.Parameters.Add(new SqlParameter("@q", SqlDbType.NVarChar, 64) { Value = q });
-    cmd.Parameters.Add(new SqlParameter("@limit", SqlDbType.Int) { Value = lim });
-
-    await using var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess, ct);
-
-    var ordId = reader.GetOrdinal("CustomerId");
-    var ordDisplay = reader.GetOrdinal("DisplayText");
-    var ordSecondary = reader.GetOrdinal("SecondaryText");
-
-    while (await reader.ReadAsync(ct))
-    {
-        var id = reader.GetInt64(ordId);
-        var display = reader.IsDBNull(ordDisplay) ? "" : reader.GetString(ordDisplay);
-        var secondary = reader.IsDBNull(ordSecondary) ? "" : reader.GetString(ordSecondary);
-
-        results.Add(new TypeaheadItem(id, display, secondary));
+        var results = await service.SearchAsync(q, limit ?? 10, ct);
+        return Results.Ok(results);
     }
-
-    var arr = results.ToArray();
-
-    // short TTL cache
-    cache.Set(cacheKey, arr, new MemoryCacheEntryOptions
+    catch (OperationCanceledException)
     {
-        AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(30)
-    });
-
-    return Results.Ok(arr);
+        return Results.StatusCode(StatusCodes.Status408RequestTimeout);
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(ex.Message);
+    }
 })
-.WithName("CustomerTypeahead");
+.WithName("CustomerTypeahead")
+.Produces<TypeaheadItem[]>();
 
 try
 {
@@ -190,14 +147,3 @@ catch (Exception ex)
 
     throw;
 }
-
-
-static bool IsTooShort(string q)
-{
-    if (string.IsNullOrWhiteSpace(q)) return true;
-    q = q.Trim();
-    // Match SQL proc behavior: email 2+, name 3+
-    return q.Contains('@') ? q.Length < 2 : q.Length < 3;
-}
-
-record TypeaheadItem(long CustomerId, string DisplayText, string SecondaryText);
