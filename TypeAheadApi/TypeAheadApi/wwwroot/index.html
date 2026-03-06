@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Customer TypeAhead</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- React + ReactDOM (dev) + Axios + Babel for JSX (no-build demo) -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script type="text/babel">
+  const {useState, useEffect, useRef} = React;
+
+  function useDebouncedCallback(fn, wait) {
+    const timer = useRef();
+    return (...args) => {
+      if (timer.current) clearTimeout(timer.current);
+      timer.current = setTimeout(() => fn(...args), wait);
+    };
+  }
+
+  function Highlight({text, query}){
+    const t = (text ?? "").toString();
+    if (!query) return <span>{t}</span>;
+    const qi = t.toLowerCase().indexOf(query.toLowerCase());
+    if (qi === -1) return <span>{t}</span>;
+    const start = t.substring(0, qi);
+    const match = t.substring(qi, qi + query.length);
+    const end = t.substring(qi + query.length);
+    return <span>{start}<mark>{match}</mark>{end}</span>;
+  }
+
+  function Typeahead() {
+    const [q, setQ] = useState('');
+    const [items, setItems] = useState([]);
+    const [open, setOpen] = useState(false);
+    const [loading, setLoading] = useState(false);
+    const [active, setActive] = useState(-1);
+    const [limit, setLimit] = useState(10);
+    const [theme, setTheme] = useState(localStorage.getItem('theme') || 'light');
+
+    const listRef = useRef(null);
+    const inputRef = useRef(null);
+    const abortRef = useRef(null);
+
+    useEffect(()=>{ document.documentElement.setAttribute('data-theme', theme); localStorage.setItem('theme', theme); },[theme]);
+
+    const debouncedFetch = useDebouncedCallback((qVal, limitVal) => {
+      if (!qVal || qVal.trim().length === 0) { setItems([]); setOpen(false); setLoading(false); return; }
+      setLoading(true);
+      if (abortRef.current) abortRef.current.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+      axios.get('/api/customers/typeahead', { params: { q: qVal, limit: limitVal }, signal: controller.signal })
+        .then(res=>{ setItems(res.data ?? []); setOpen(true); setActive(-1); })
+        .catch(err=>{ if (axios.isCancel(err)) return; console.warn(err); })
+        .finally(()=>{ setLoading(false); abortRef.current = null; });
+    }, 250);
+
+    useEffect(()=>{ debouncedFetch(q, limit); }, [q, limit]);
+
+    function onKeyDown(e){
+      if (!open) { if (e.key === 'ArrowDown' && items.length) setOpen(true); return; }
+      if (e.key === 'ArrowDown'){ e.preventDefault(); setActive(a => Math.min(a + 1, items.length - 1)); }
+      else if (e.key === 'ArrowUp'){ e.preventDefault(); setActive(a => Math.max(a - 1, 0)); }
+      else if (e.key === 'Enter'){ e.preventDefault(); if (active >= 0 && active < items.length) select(items[active]); }
+      else if (e.key === 'Escape'){ setOpen(false); }
+    }
+
+    function select(item){ setQ(item.DisplayText); setOpen(false); inputRef.current?.focus(); }
+
+    useEffect(()=>{ if (active >= 0 && listRef.current){ const node = document.getElementById(`ta-item-${active}`); node?.scrollIntoView({ block: 'nearest' }); } }, [active]);
+
+    return (
+      <div className="container">
+        <header className="topbar">
+          <h1>TypeAhead Demo</h1>
+          <div className="controls">
+            <label className="switch">
+              <input type="checkbox" checked={theme==='dark'} onChange={e=>setTheme(e.target.checked? 'dark':'light')} aria-label="Toggle dark mode" />
+              <span className="slider" />
+            </label>
+          </div>
+        </header>
+
+        <main>
+          <p className="lead">Try typing a name or email. Results show in a keyboard-friendly dropdown.</p>
+
+          <div className="ta-wrapper">
+            <div className="input-row">
+              <input
+                ref={inputRef}
+                aria-autocomplete="list"
+                aria-controls="ta-listbox"
+                aria-expanded={open}
+                aria-activedescendant={active >=0 ? `ta-item-${active}` : undefined}
+                role="combobox"
+                placeholder="Search customers..."
+                value={q}
+                onChange={e=>setQ(e.target.value)}
+                onKeyDown={onKeyDown}
+                className="ta-input"
+              />
+              <select className="limit" value={limit} onChange={e=>setLimit(Number(e.target.value))} aria-label="Result limit">
+                <option value={5}>5</option>
+                <option value={10}>10</option>
+                <option value={20}>20</option>
+              </select>
+            </div>
+
+            <div className={`dropdown ${open ? 'open' : ''}`} role="listbox" id="ta-listbox" ref={listRef}>
+              {loading && <div className="empty">Loading…</div>}
+              {!loading && items.length === 0 && q.trim().length > 0 && <div className="empty">No results</div>}
+              {!loading && items.map((it, i) => (
+                <div
+                  key={it.customerId ?? it.CustomerId ?? i}
+                  id={`ta-item-${i}`}
+                  role="option"
+                  aria-selected={i === active}
+                  className={`item ${i===active ? 'active' : ''}`}
+                  onMouseEnter={()=>setActive(i)}
+                  onMouseLeave={()=>setActive(-1)}
+                  onClick={()=>select(it)}
+                >
+                  <div className="display"><Highlight text={it.displayText ?? it.DisplayText} query={q} /></div>
+                  <div className="secondary"><Highlight text={it.secondaryText ?? it.SecondaryText} query={q} /></div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <section className="notes">
+            <p className="muted">This demo calls <code>/api/customers/typeahead?q=...</code> on the same host. Adjust your API base path if necessary.</p>
+          </section>
+        </main>
+
+        <footer>
+          <small>Responsive, keyboard + ARIA, theme toggle.</small>
+        </footer>
+      </div>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById('root')).render(<Typeahead />);
+  </script>
+</body>
+</html>

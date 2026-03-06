@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Customer TypeAhead</title>
+  <style>
+    body { font-family: system-ui, Arial; margin: 40px; }
+    .box { max-width: 720px; }
+    input { width: 100%; padding: 12px; font-size: 16px; }
+    .hint { color: #666; margin-top: 8px; font-size: 13px; }
+    ul { list-style: none; padding: 0; margin: 12px 0 0 0; border: 1px solid #ddd; border-radius: 8px; overflow: hidden; }
+    li { padding: 10px 12px; border-top: 1px solid #eee; }
+    li:first-child { border-top: none; }
+    .primary { font-weight: 600; }
+    .secondary { color: #666; font-size: 13px; margin-top: 2px; }
+    .meta { margin-top: 8px; font-size: 12px; color: #666; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h2>Customer TypeAhead</h2>
+    <input id="q" autocomplete="off" placeholder="Type: bas, smi, user12@ ..." />
+    <div class="hint">Rules: 3+ chars for name, 2+ for email (with @). Debounced + cancels in-flight requests.</div>
+
+    <div class="meta" id="meta"></div>
+    <ul id="results"></ul>
+  </div>
+
+  <script>
+    const input = document.getElementById("q");
+    const ul = document.getElementById("results");
+    const meta = document.getElementById("meta");
+
+    let timer = null;
+    let controller = null;
+
+    function render(items) {
+      ul.innerHTML = "";
+      for (const it of items) {
+        const li = document.createElement("li");
+        li.innerHTML = `
+          <div class="primary">${escapeHtml(it.displayText)}</div>
+          <div class="secondary">${escapeHtml(it.secondaryText ?? "")}</div>
+        `;
+        ul.appendChild(li);
+      }
+    }
+
+    function escapeHtml(s) {
+      return (s ?? "").replace(/[&<>"']/g, (c) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#039;"
+      }[c]));
+    }
+
+    async function search(q) {
+      if (controller) controller.abort();
+      controller = new AbortController();
+
+      const t0 = performance.now();
+      const url = `/api/customers/typeahead?q=${encodeURIComponent(q)}&limit=10`;
+
+      try {
+        const res = await fetch(url, { signal: controller.signal });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const ms = Math.round(performance.now() - t0);
+
+        meta.textContent = `Results: ${data.length} | ${ms} ms`;
+        render(data);
+      } catch (e) {
+        if (e.name === "AbortError") return;
+        meta.textContent = `Error: ${e.message}`;
+        render([]);
+      }
+    }
+
+    input.addEventListener("input", () => {
+      const q = input.value.trim();
+
+      // quick UI-side guard to avoid hammering API
+      const isEmail = q.includes("@");
+      const tooShort = isEmail ? q.length < 2 : q.length < 3;
+      if (tooShort) {
+        if (controller) controller.abort();
+        meta.textContent = "";
+        render([]);
+        return;
+      }
+
+      clearTimeout(timer);
+      timer = setTimeout(() => search(q), 200); // debounce 200ms
+    });
+  </script>
+</body>
+</html>

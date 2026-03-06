@@ -1,0 +1,203 @@
+using System;
+using System.Data;
+using System.IO;
+using Microsoft.Extensions.Logging;
+using Microsoft.Data.SqlClient;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Caching.Memory;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Configure logging early so build/startup errors are visible
+builder.Logging.ClearProviders();
+builder.Logging.AddConsole();
+builder.Logging.AddDebug();
+
+// Register services BEFORE Build()
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+builder.Services.AddMemoryCache();
+builder.Services.AddHealthChecks();
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowAll", p => p.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader());
+});
+
+WebApplication app;
+try
+{
+    app = builder.Build();
+}
+catch (Exception ex)
+{
+    // If build fails, try to log to console and a file so the root cause is visible
+    using var lf = LoggerFactory.Create(lb => { lb.AddConsole(); lb.AddDebug(); });
+    var log = lf.CreateLogger("HostBuild");
+    log.LogCritical(ex, "Host build failed");
+    try
+    {
+        Directory.CreateDirectory("logs");
+        File.AppendAllText(Path.Combine("logs", "host-errors.log"), DateTime.UtcNow.ToString("o") + " BUILD FAILED: " + ex + Environment.NewLine);
+    }
+    catch { }
+    throw;
+}
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseDeveloperExceptionPage();
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+else
+{
+    app.UseExceptionHandler("/error");
+}
+
+app.UseHttpsRedirection();
+app.UseCors("AllowAll");
+app.UseDefaultFiles();
+app.UseStaticFiles();
+
+app.MapGet("/error", (HttpContext http) => Results.Problem("An internal server error occurred"))
+   .ExcludeFromDescription();
+
+app.MapHealthChecks("/health");
+
+if (app.Environment.IsDevelopment())
+{
+    app.MapGet("/debug/csb", ([FromServices] IConfiguration config) =>
+    {
+        var cs = config.GetConnectionString("Sql");
+        if (string.IsNullOrWhiteSpace(cs)) return Results.Problem("Missing ConnectionStrings:Sql");
+
+        var csb = new SqlConnectionStringBuilder(cs);
+        return Results.Ok(new { csb.DataSource, csb.InitialCatalog });
+    });
+
+    app.MapGet("/debug/sqlping", async ([FromServices] IConfiguration config, CancellationToken ct) =>
+    {
+        var cs = config.GetConnectionString("Sql");
+        if (string.IsNullOrWhiteSpace(cs)) return Results.Problem("Missing ConnectionStrings:Sql");
+
+        try
+        {
+            await using var conn = new SqlConnection(cs);
+            await conn.OpenAsync(ct);
+
+            await using var cmd = new SqlCommand("SELECT @@SERVERNAME, DB_NAME(), @@VERSION", conn);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            await r.ReadAsync(ct);
+
+            return Results.Ok(new
+            {
+                serverName = r.GetString(0),
+                database = r.GetString(1),
+                version = r.GetString(2)
+            });
+        }
+        catch (Exception ex)
+        {
+            return Results.Problem(ex.ToString(), title: "SQL connection failed");
+        }
+    });
+}
+
+app.MapGet("/api/customers/typeahead", async (
+    [FromQuery] string q,
+    [FromQuery] int? limit,
+    [FromServices] IConfiguration config,
+    [FromServices] IMemoryCache cache,
+    CancellationToken ct) =>
+{
+    q = (q ?? string.Empty).Trim();
+    var lim = Math.Clamp(limit ?? 10, 1, 50);
+
+    if (IsTooShort(q))
+        return Results.Ok(Array.Empty<TypeaheadItem>());
+
+    var cs = config.GetConnectionString("Sql");
+    if (string.IsNullOrWhiteSpace(cs))
+        return Results.Problem("Missing ConnectionStrings:Sql in appsettings.json");
+
+    // Cache key for hot queries
+    var cacheKey = $"cust:ta:{q.ToUpperInvariant()}:{lim}";
+    if (cache.TryGetValue(cacheKey, out TypeaheadItem[] cached))
+        return Results.Ok(cached);
+
+    var results = new List<TypeaheadItem>(lim);
+
+    await using var conn = new SqlConnection(cs);
+
+    await conn.OpenAsync(ct);
+
+    await using var cmd = new SqlCommand("dbo.usp_CustomerTypeahead", conn)
+    {
+        CommandType = CommandType.StoredProcedure,
+        CommandTimeout = 5
+    };
+
+    cmd.Parameters.Add(new SqlParameter("@q", SqlDbType.NVarChar, 64) { Value = q });
+    cmd.Parameters.Add(new SqlParameter("@limit", SqlDbType.Int) { Value = lim });
+
+    await using var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess, ct);
+
+    var ordId = reader.GetOrdinal("CustomerId");
+    var ordDisplay = reader.GetOrdinal("DisplayText");
+    var ordSecondary = reader.GetOrdinal("SecondaryText");
+
+    while (await reader.ReadAsync(ct))
+    {
+        var id = reader.GetInt64(ordId);
+        var display = reader.IsDBNull(ordDisplay) ? "" : reader.GetString(ordDisplay);
+        var secondary = reader.IsDBNull(ordSecondary) ? "" : reader.GetString(ordSecondary);
+
+        results.Add(new TypeaheadItem(id, display, secondary));
+    }
+
+    var arr = results.ToArray();
+
+    // short TTL cache
+    cache.Set(cacheKey, arr, new MemoryCacheEntryOptions
+    {
+        AbsoluteExpirationRelativeToNow = TimeSpan.FromSeconds(30)
+    });
+
+    return Results.Ok(arr);
+})
+.WithName("CustomerTypeahead");
+
+try
+{
+    app.Run();
+}
+catch (Exception ex)
+{
+    // Log runtime exceptions to console and file
+    try
+    {
+        var logger = app.Services.GetService<ILogger<Program>>() ?? LoggerFactory.Create(lb => lb.AddConsole()).CreateLogger("HostRun");
+        logger.LogCritical(ex, "Host terminated unexpectedly");
+    }
+    catch { }
+
+    try
+    {
+        Directory.CreateDirectory("logs");
+        File.AppendAllText(Path.Combine("logs", "host-errors.log"), DateTime.UtcNow.ToString("o") + " RUN FAILED: " + ex + Environment.NewLine);
+    }
+    catch { }
+
+    throw;
+}
+
+
+static bool IsTooShort(string q)
+{
+    if (string.IsNullOrWhiteSpace(q)) return true;
+    q = q.Trim();
+    // Match SQL proc behavior: email 2+, name 3+
+    return q.Contains('@') ? q.Length < 2 : q.Length < 3;
+}
+
+record TypeaheadItem(long CustomerId, string DisplayText, string SecondaryText);
